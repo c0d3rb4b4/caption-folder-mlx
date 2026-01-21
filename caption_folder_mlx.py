@@ -125,8 +125,6 @@ def main():
                 f"# timestamp: {ts}\n"
                 f"# image: {img_path.name}\n\n"
             )
-
-        out_path.write_text(header + caption + "\n", encoding="utf-8")
         
         try:
             img = Image.open(img_path)
@@ -194,7 +192,7 @@ def main():
             #for w in REPLACEMENTS:
             #    caption = caption.replace(w, " [trigger]")
 
-            out_path.write_text(caption + "\n", encoding="utf-8")
+            out_path.write_text(header + caption + "\n", encoding="utf-8")
 
             print(f"OK: {img_path.name} -> {out_path.name}")
         except Exception as e:
