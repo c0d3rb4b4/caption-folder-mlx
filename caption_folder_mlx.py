@@ -14,12 +14,25 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 
 DEFAULT_MODEL = "mlx-community/Qwen2.5-VL-7B-Instruct-8bit"
 
-DEFAULT_PROMPT = """Describe the image with emphasis on:
-- Pose/body position (standing/sitting, limb positions, orientation, gaze)
-- Clothing & accessories (type, colors, layers, fit, footwear, jewelry)
-- Actions/interactions (what the person is doing/holding/touching)
-Be concrete. Avoid guessing identity. If something is unclear, say "unclear".
-Return 2-4 sentences.
+DEFAULT_PROMPT = """You are captioning an image for dataset creation.
+
+IMPORTANT RULES:
+- Refer to the human subject ONLY as "[trigger]".
+- DO NOT use words like person, woman, man, girl, boy, model, subject, individual.
+- If multiple people appear, still describe the primary subject as "[trigger]".
+- Never infer identity, age, or name.
+
+Describe the image with emphasis on:
+Pose: body position, limb placement, posture, orientation, gaze.
+Clothes: garments, colors, materials, layers, fit, footwear, accessories.
+Action: what [trigger] is doing, holding, touching, or interacting with.
+Scene: brief environment/context.
+
+Return exactly 4 lines in this format:
+Pose: ...
+Clothes: ...
+Action: ...
+Scene: ...
 """
 
 def iter_images(folder: Path, recursive: bool):
@@ -94,6 +107,16 @@ def main():
                         caption = str(result)
 
             caption = caption.strip()
+
+            # Hard replace common human nouns just in case
+            REPLACEMENTS = [
+                " person", " woman", " man", " girl", " boy",
+                " Person", " Woman", " Man", " Girl", " Boy",
+                " model", " Model", " subject", " Subject"
+            ]
+
+            for w in REPLACEMENTS:
+                caption = caption.replace(w, " [trigger]")
 
             out_path.write_text(caption + "\n", encoding="utf-8")
             print(f"OK: {img_path.name} -> {out_path.name}")
