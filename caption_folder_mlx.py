@@ -66,7 +66,7 @@ def main():
             formatted = apply_chat_template(processor, config, args.prompt, num_images=1)
 
             # generate() accepts PIL images in a list (per MLX-VLM docs/examples)
-            caption = generate(
+            result = generate(
                 model,
                 processor,
                 formatted,
@@ -74,7 +74,26 @@ def main():
                 max_tokens=args.max_tokens,
                 temperature=args.temperature,
                 verbose=False,
-            ).strip()
+            )
+
+            # mlx-vlm may return either a string or a GenerationResult-like object
+            if isinstance(result, str):
+                caption = result
+            else:
+                # common attribute names across versions
+                caption = (
+                    getattr(result, "text", None)
+                    or getattr(result, "output_text", None)
+                    or getattr(result, "generated_text", None)
+                )
+                if caption is None:
+                    # last resort: try dict-like or repr
+                    try:
+                        caption = result["text"]
+                    except Exception:
+                        caption = str(result)
+
+            caption = caption.strip()
 
             out_path.write_text(caption + "\n", encoding="utf-8")
             print(f"OK: {img_path.name} -> {out_path.name}")
