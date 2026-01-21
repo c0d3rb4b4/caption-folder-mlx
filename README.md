@@ -21,6 +21,109 @@ This tool was built and tested on **Apple M‑series (M2/M3/M4)** machines and i
 
 ---
 
+## Distributed Mode (Remote MLX Machines)
+
+For large datasets, distribute captioning across **multiple remote MLX machines** via SSH:
+
+```bash
+python caption_folder_mlx_remote.py ./images --config hosts.json
+```
+
+This will:
+- Connect to each configured MLX machine via SSH (password-authenticated)
+- Distribute images evenly across machines
+- Copy images to remote, generate captions, copy results back
+- Maintain the same skip logic and caption format
+- Clean up remote temporary files automatically
+
+### Setup
+
+### Setup
+
+1. **Create a `hosts.json` config** (see `hosts_example.json`):
+   ```json
+   {
+     "hosts": [
+       {
+         "hostname": "mlx-machine-1.example.com",
+         "username": "user",
+         "password": "your-password",
+         "port": 22,
+         "remote_work_dir": "/tmp/caption_work",
+         "script_path": "/opt/caption-folder-mlx/caption_folder_mlx.py"
+       },
+       {
+         "hostname": "mlx-machine-2.example.com",
+         "username": "user",
+         "password": "your-password",
+         "port": 22,
+         "remote_work_dir": "/tmp/caption_work_2",
+         "script_path": "/opt/caption-folder-mlx/caption_folder_mlx.py"
+       }
+     ]
+   }
+   ```
+
+2. **Ensure remote machines have Python 3.11.14 installed**:
+   ```bash
+   # Check if available
+   python3.11 --version
+   
+   # If not installed, the setup will fail with clear instructions
+   ```
+
+3. **Just run the script** - it handles everything else:
+   ```bash
+   python caption_folder_mlx_remote.py ./images --config hosts.json
+   ```
+
+The script will automatically:
+- ✅ Install local dependencies (`paramiko`, `tqdm`) if needed
+- ✅ Create virtual environments on all remote machines
+- ✅ Install all MLX dependencies on remote machines
+- ✅ Deploy the caption script to remote machines
+- ✅ Verify everything before starting captioning
+
+### Options
+
+All local script options work with the remote version:
+
+```bash
+--model mlx-community/Qwen2.5-VL-7B-Instruct-8bit
+--max-tokens 170
+--temperature 0.15
+--max-side 1280
+--verify
+--fixed-name
+--overwrite
+--recursive
+--no-replace-nouns
+```
+
+Example:
+```bash
+python caption_folder_mlx_remote.py ./large_dataset \
+  --config hosts.json \
+  --model mlx-community/InternVL2-8B-MLX \
+  --verify \
+  --max-side 1024
+```
+
+### Features
+
+- ✅ **Skip already-captioned images** (same model)
+- ✅ **Progress bar** with current status per remote machine
+- ✅ **Automatic cleanup** of temporary files on remote
+- ✅ **SFTP file transfer** (efficient binary copying)
+- ✅ **Load balancing** distributes images evenly across hosts
+- ✅ **Error resilience** continues if one machine fails
+
+### Performance
+
+With 4 MLX machines processing in parallel, you can expect ~4x throughput compared to single-machine mode.
+
+---
+
 ## Example Output
 
 ```
@@ -41,23 +144,61 @@ Scene: indoor studio with plain background
 
 ### 1. Create a virtual environment
 
+**On Linux/macOS:**
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-### 2. Install dependencies
-
-```bash
-pip install --upgrade pip
-pip install mlx mlx-vlm pillow
+**On Windows (PowerShell):**
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
 ```
 
-> ⚠️ **Do NOT install PyTorch** — this tool is MLX-only.
+**On Windows (Command Prompt):**
+```cmd
+python -m venv .venv
+.venv\Scripts\activate.bat
+```
+
+### 2. Install dependencies
+
+**On macOS (Apple Silicon) or Linux:**
+```bash
+pip install --upgrade pip
+pip install mlx mlx-vlm pillow tqdm
+```
+
+**On Windows (for remote mode only):**
+```powershell
+python caption_folder_mlx_remote.py ./images --config hosts.json
+```
+
+The script will automatically install `paramiko` and `tqdm` locally if needed!
 
 ---
 
-## Supported Models (MLX‑Compatible)
+## System Requirements
+
+### Local Host (where you run the script)
+- **macOS (Apple Silicon M1/M2/M3/M4+)** or **Linux** (required for MLX)
+  - **Python 3.10+** 
+  - `mlx`, `mlx-vlm`, `Pillow`, `tqdm`
+- **Windows**: Use distributed mode only (see below)
+  - **Python 3.10+**
+  - `paramiko` for remote SSH connections
+  - `tqdm` for progress bars
+  - ⚠️ Cannot run local captioning on Windows (MLX not supported)
+
+### Remote Machines (MLX captioning)
+- **Linux** (recommended) or **macOS Apple Silicon**
+- **Python 3.11.14** (specifically for MLX compatibility)
+- `mlx`, `mlx-vlm`, `Pillow`, `tqdm`
+
+> ⚠️ **Important**: Remote machines MUST have Python 3.11.14. The automated setup will verify this.
+
+---
 
 ✅ Recommended:
 
@@ -75,6 +216,8 @@ pip install mlx mlx-vlm pillow
 
 ## Basic Usage
 
+### Local Mode (macOS Apple Silicon / Linux only)
+
 ```bash
 python caption_folder_mlx.py ./images
 ```
@@ -82,6 +225,18 @@ python caption_folder_mlx.py ./images
 This will:
 - Caption every image in `./images`
 - Write `<image>__<model>__<timestamp>.txt` next to each image
+
+> ⚠️ **Not available on Windows** — use distributed mode instead.
+
+### Distributed Mode (Windows, macOS, Linux)
+
+Connect to multiple remote MLX machines to distribute the work:
+
+```bash
+python caption_folder_mlx_remote.py ./images --config hosts.json
+```
+
+This works from **any OS** (Windows, macOS, Linux) to orchestrate remote MLX machines.
 
 ---
 
