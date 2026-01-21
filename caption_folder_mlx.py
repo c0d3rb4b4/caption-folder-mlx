@@ -24,15 +24,20 @@ DEFAULT_MODEL = "mlx-community/Qwen2.5-VL-7B-Instruct-8bit"
 DEFAULT_PROMPT = """You are generating a factual caption for an image dataset.
 
 CRITICAL RULES:
+- Do NOT replace visible genital anatomy with euphemisms such as "inner thighs" or "private area".
+- Precision is preferred over vagueness when visibility is clear.
 - Describe ONLY what is clearly visible. Do not guess missing details.
 - If a detail is uncertain, write "unclear" rather than inventing.
 - Refer to the main human subject ONLY as "[trigger]". Do not use person/woman/man/girl/boy/model/subject.
-- If the image contains nudity or sexual content, describe it clinically and neutrally (e.g., "nudity", "lingerie", "explicit sexual activity"), without erotic language.
+- If the image contains nudity or sexual content, describe it clinically and anatomically accurately.
+- Use correct anatomical terms (e.g., vulva, labia, penis, breasts) ONLY when they are clearly visible.
+- Do not euphemize anatomy that is clearly shown.
+- If anatomy is partially visible or ambiguous, say "unclear".
 
 Return exactly 5 lines:
 Pose: (posture, limb placement, orientation, gaze)
 Clothes: (garments, colors, layers; if nude, say "nudity" and what is visible)
-Action: (what [trigger] is doing/holding/touching/interacting with)
+Action: (what [trigger] is doing with their body or hands; be anatomically accurate if visible)
 NSFW: (none | nudity | lingerie | explicit)
 Scene: (brief environment/context)
 """
@@ -175,12 +180,9 @@ Caption to verify:
 {caption1}
 
 Instructions:
-- Check each line for accuracy against the image.
-- Remove any incorrect or uncertain details.
-- Replace unknowns with "unclear".
-- Keep the same 5-line format (Pose/Clothes/Action/NSFW/Scene).
-- Main subject must be called [trigger].
-- Do not add extra commentary.
+- Replace any euphemisms with anatomically accurate terms if anatomy is clearly visible.
+- Do not introduce new details.
+- If the original caption avoided specificity incorrectly, correct it.
 
 Now output the corrected caption only.
 """
