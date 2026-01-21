@@ -32,6 +32,8 @@ REMOTE_DEP_VERSIONS = [
     ("mlx-lm", "0.23.2"),
     ("transformers", "4.51.3"),
     ("Pillow", "12.1.0"),
+    ("pydantic", "2.9.2"),
+    ("soundfile", "0.13.1"),
     ("tqdm", "4.67.1"),
 ]
 REMOTE_DEP_VERSION_MAP = {name: version for name, version in REMOTE_DEP_VERSIONS}
