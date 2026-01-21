@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 from PIL import Image
+from tqdm import tqdm
 
 from mlx_vlm import load, generate
 from mlx_vlm.prompt_utils import apply_chat_template
@@ -140,6 +141,33 @@ def make_output_path(img_path: Path, model_id: str, ts: str, fixed_name: bool) -
         return img_path.with_suffix(".txt")
     model_tag = hf_model_id_to_filename(model_id)
     return img_path.with_name(f"{img_path.stem}__{model_tag}__{ts}.txt")
+
+
+def caption_exists_for_model(img_path: Path, model_id: str, fixed_name: bool) -> tuple[bool, Optional[Path]]:
+    """
+    Check if a caption already exists for this image and model.
+    Returns (exists, path) where path is the existing file or None.
+    
+    - If fixed_name=True, checks for <stem>.txt
+    - If fixed_name=False, checks for any <stem>__<model_tag>__*.txt
+    """
+    if fixed_name:
+        expected = img_path.with_suffix(".txt")
+        if expected.exists():
+            return True, expected
+        return False, None
+    
+    # Check for any timestamped file with this model
+    model_tag = hf_model_id_to_filename(model_id)
+    pattern = f"{img_path.stem}__{model_tag}__*.txt"
+    parent = img_path.parent
+    
+    # Use glob to find matching files
+    matches = list(parent.glob(pattern))
+    if matches:
+        # Return the first (or most recent) match
+        return True, matches[0]
+    return False, None
 
 
 def caption_one_inprocess(
@@ -307,6 +335,9 @@ def main() -> None:
         print("No images found.")
         return
 
+    total_images = len(images)
+    print(f"Found {total_images} image(s) to process.")
+
     # Load model once unless we isolate per image
     model = processor = config = None
     if not args.isolate:
@@ -316,64 +347,76 @@ def main() -> None:
 
     venv_python = sys.executable
 
-    for img_path in images:
-        ts = now_tag()
-        out_path = make_output_path(img_path, args.model, ts, fixed_name=args.fixed_name)
+    # Progress bar with status display
+    with tqdm(total=total_images, desc="Captioning images", unit="img") as pbar:
+        for img_path in images:
+            ts = now_tag()
+            out_path = make_output_path(img_path, args.model, ts, fixed_name=args.fixed_name)
 
-        if out_path.exists() and not args.overwrite:
-            print(f"SKIP (exists): {out_path.name}")
-            continue
+            # Check if caption already exists for this model (ignoring timestamp)
+            if not args.overwrite:
+                exists, existing_path = caption_exists_for_model(img_path, args.model, args.fixed_name)
+                if exists:
+                    pbar.set_postfix_str(f"SKIP: {existing_path.name}")
+                    pbar.update(1)
+                    continue
 
-        header = build_header(args.model, ts, img_path.name)
+            header = build_header(args.model, ts, img_path.name)
 
-        try:
-            if args.isolate:
-                # Spawn child that loads model and captions one image
-                child_argv = [
-                    str(Path(__file__).resolve()),
-                    "--_single",
-                    "--_image", str(img_path),
-                    "--model", args.model,
-                    "--prompt", args.prompt,
-                    "--max-side", str(args.max_side),
-                    "--max-tokens", str(args.max_tokens),
-                    "--temperature", str(args.temperature),
-                ]
-                if args.verify:
-                    child_argv.append("--verify")
-                if args.fixed_name:
-                    child_argv.append("--fixed-name")
-                if args.overwrite:
-                    child_argv.append("--overwrite")
-                if args.no_replace_nouns:
-                    child_argv.append("--no-replace-nouns")
+            try:
+                # Update progress bar with current image being processed
+                pbar.set_postfix_str(f"Processing: {img_path.name}")
 
-                rc, stdout, stderr = run_isolated_child(venv_python, child_argv)
-                if rc != 0:
-                    raise RuntimeError(f"child failed (rc={rc}). stderr:\n{stderr.strip()}\nstdout:\n{stdout.strip()}")
-                caption = stdout.strip()
-                if not caption:
-                    raise RuntimeError(f"child returned empty caption. stderr:\n{stderr.strip()}")
-            else:
-                assert model is not None and processor is not None and config is not None
-                caption = caption_one_inprocess(
-                    model=model,
-                    processor=processor,
-                    config=config,
-                    img_path=img_path,
-                    prompt=args.prompt,
-                    max_side=args.max_side,
-                    max_tokens=args.max_tokens,
-                    temperature=args.temperature,
-                    verify=args.verify,
-                    replace_nouns=replace_nouns,
-                )
+                if args.isolate:
+                    # Spawn child that loads model and captions one image
+                    child_argv = [
+                        str(Path(__file__).resolve()),
+                        "--_single",
+                        "--_image", str(img_path),
+                        "--model", args.model,
+                        "--prompt", args.prompt,
+                        "--max-side", str(args.max_side),
+                        "--max-tokens", str(args.max_tokens),
+                        "--temperature", str(args.temperature),
+                    ]
+                    if args.verify:
+                        child_argv.append("--verify")
+                    if args.fixed_name:
+                        child_argv.append("--fixed-name")
+                    if args.overwrite:
+                        child_argv.append("--overwrite")
+                    if args.no_replace_nouns:
+                        child_argv.append("--no-replace-nouns")
 
-            out_path.write_text(header + caption + "\n", encoding="utf-8")
-            print(f"OK: {img_path.name} -> {out_path.name}")
+                    rc, stdout, stderr = run_isolated_child(venv_python, child_argv)
+                    if rc != 0:
+                        raise RuntimeError(f"child failed (rc={rc}). stderr:\n{stderr.strip()}\nstdout:\n{stdout.strip()}")
+                    caption = stdout.strip()
+                    if not caption:
+                        raise RuntimeError(f"child returned empty caption. stderr:\n{stderr.strip()}")
+                else:
+                    assert model is not None and processor is not None and config is not None
+                    caption = caption_one_inprocess(
+                        model=model,
+                        processor=processor,
+                        config=config,
+                        img_path=img_path,
+                        prompt=args.prompt,
+                        max_side=args.max_side,
+                        max_tokens=args.max_tokens,
+                        temperature=args.temperature,
+                        verify=args.verify,
+                        replace_nouns=replace_nouns,
+                    )
 
-        except Exception as e:
-            print(f"ERR: {img_path.name}: {e}")
+                out_path.write_text(header + caption + "\n", encoding="utf-8")
+                pbar.set_postfix_str(f"✓ Generated: {out_path.name}")
+                pbar.update(1)
+
+            except Exception as e:
+                pbar.set_postfix_str(f"✗ ERROR: {img_path.name}")
+                tqdm.write(f"ERR: {img_path.name}: {e}")
+                pbar.update(1)
 
 
 if __name__ == "__main__":
