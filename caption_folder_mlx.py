@@ -15,6 +15,9 @@ from mlx_vlm.utils import load_config
 import re
 from datetime import datetime
 
+import subprocess
+import sys
+
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 
 DEFAULT_MODEL = "mlx-community/Qwen2.5-VL-7B-Instruct-8bit"
@@ -103,6 +106,40 @@ def extract_text(gen_result) -> str:
     # If we get here, something is wrong—do NOT write garbage to disk.
     raise TypeError(f"Could not extract caption text from generate() result of type {type(gen_result)}")
 
+def caption_via_mlx_cli(model_id: str, prompt: str, image_path: str, max_tokens: int, temperature: float) -> str:
+    # Use the installed console script if available; fallback to python -m
+    cmd = [
+        "mlx_vlm.generate",
+        "--model", model_id,
+        "--max-tokens", str(max_tokens),
+        "--temperature", str(temperature),
+        "--prompt", prompt,
+        "--image", image_path,
+    ]
+
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        # fallback: python -m (works if module entry exists)
+        cmd = [
+            sys.executable, "-m", "mlx_vlm.generate",
+            "--model", model_id,
+            "--max-tokens", str(max_tokens),
+            "--temperature", str(temperature),
+            "--prompt", prompt,
+            "--image", image_path,
+        ]
+        p = subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+    out = (p.stdout or "").strip()
+    err = (p.stderr or "").strip()
+
+    if p.returncode != 0 or not out:
+        raise RuntimeError(f"mlx_vlm.generate failed (rc={p.returncode}). stderr:\n{err}\nstdout:\n{out}")
+
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("folder", help="Folder containing images")
@@ -158,8 +195,13 @@ def main():
             formatted = apply_chat_template(processor, config, args.prompt, num_images=1)
 
             # PASS 1: initial caption
-            result1 = generate(model, processor, formatted, [img],
-                   max_tokens=args.max_tokens, temperature=args.temperature, verbose=False)
+            result1 =caption_via_mlx_cli(
+                        model_id=args.model,
+                        prompt=formatted,               # NOTE: pass formatted_prompt (chat-templated)
+                        image_path=str(img_path),       # pass the file path, not the PIL image
+                        max_tokens=args.max_tokens,
+                        temperature=args.temperature,
+                    ).strip()
             
             print("DEBUG generate() type:", type(result1))
             print("DEBUG dir:", [a for a in dir(result1) if "text" in a.lower() or "output" in a.lower()])
@@ -183,8 +225,13 @@ def main():
             """
 
             formatted2 = apply_chat_template(processor, config, verify_prompt, num_images=1)
-            result2 = generate(model, processor, formatted2, [img],
-                            max_tokens=args.max_tokens, temperature=0.0, verbose=False)
+            result2 = caption_via_mlx_cli(
+                        model_id=args.model,
+                        prompt=formatted2,               # NOTE: pass formatted_prompt (chat-templated)
+                        image_path=str(img_path),       # pass the file path, not the PIL image
+                        max_tokens=args.max_tokens,
+                        temperature=0.0,
+                    ).strip()
 
             caption = extract_text(result2).strip()
 
