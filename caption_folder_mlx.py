@@ -66,20 +66,42 @@ def hf_model_id_to_filename(model_id: str) -> str:
 
     return s
 
-def extract_text(result):
-    if isinstance(result, str):
-        return result
+def extract_text(gen_result) -> str:
+    """
+    mlx_vlm.generate() may return:
+      - str
+      - GenerationResult-like object with .text / .output_text / .generated_text
+      - dict with 'text'
+    This extracts the actual generated caption text, or raises if missing.
+    """
+    if isinstance(gen_result, str):
+        return gen_result
+
+    # common attribute names
     for attr in ("text", "output_text", "generated_text"):
-        v = getattr(result, attr, None)
+        v = getattr(gen_result, attr, None)
         if isinstance(v, str) and v.strip():
             return v
+        # sometimes it's a list of strings
+        if isinstance(v, (list, tuple)) and v and isinstance(v[0], str):
+            joined = "\n".join(s for s in v if isinstance(s, str)).strip()
+            if joined:
+                return joined
+
+    # dict-like
     try:
-        v = result["text"]
-        if isinstance(v, str):
+        v = gen_result.get("text")  # type: ignore[attr-defined]
+        if isinstance(v, str) and v.strip():
             return v
+        if isinstance(v, (list, tuple)) and v and isinstance(v[0], str):
+            joined = "\n".join(v).strip()
+            if joined:
+                return joined
     except Exception:
         pass
-    return str(result)
+
+    # If we get here, something is wrong—do NOT write garbage to disk.
+    raise TypeError(f"Could not extract caption text from generate() result of type {type(gen_result)}")
 
 def main():
     ap = argparse.ArgumentParser()
@@ -138,6 +160,9 @@ def main():
             # PASS 1: initial caption
             result1 = generate(model, processor, formatted, [img],
                    max_tokens=args.max_tokens, temperature=args.temperature, verbose=False)
+            
+            print("DEBUG generate() type:", type(result1))
+            print("DEBUG dir:", [a for a in dir(result1) if "text" in a.lower() or "output" in a.lower()])
             
             caption1 = extract_text(result1).strip()
 
