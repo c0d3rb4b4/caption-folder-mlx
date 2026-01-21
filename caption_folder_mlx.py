@@ -41,6 +41,18 @@ def iter_images(folder: Path, recursive: bool):
     else:
         yield from (p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
 
+def downscale(img: Image.Image, max_side: int) -> Image.Image:
+    if max_side <= 0:
+        return img
+    w, h = img.size
+    m = max(w, h)
+    if m <= max_side:
+        return img
+    scale = max_side / float(m)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    return img.resize((new_w, new_h), Image.LANCZOS)
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("folder", help="Folder containing images")
@@ -50,6 +62,9 @@ def main():
     ap.add_argument("--overwrite", action="store_true", help="Overwrite existing .txt files")
     ap.add_argument("--max-tokens", type=int, default=160)
     ap.add_argument("--temperature", type=float, default=0.1)
+    ap.add_argument("--max-side", type=int, default=1280,
+                help="Resize so the longest image side is <= this (0 disables).")
+
     args = ap.parse_args()
 
     folder = Path(args.folder).expanduser().resolve()
@@ -75,6 +90,8 @@ def main():
             img = Image.open(img_path)
             if img.mode != "RGB":
                 img = img.convert("RGB")
+            
+            img = downscale(img, args.max_side)
 
             formatted = apply_chat_template(processor, config, args.prompt, num_images=1)
 
