@@ -3,36 +3,36 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from platform import processor
+from unittest import result
+from xml.parsers.expat import model
 
 from PIL import Image
 
 from mlx_vlm import load, generate
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.utils import load_config
+import re
+from datetime import datetime
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 
 DEFAULT_MODEL = "mlx-community/Qwen2.5-VL-7B-Instruct-8bit"
 
-DEFAULT_PROMPT = """You are captioning an image for dataset creation.
+DEFAULT_PROMPT = """You are generating a factual caption for an image dataset.
 
-IMPORTANT RULES:
-- Refer to the human subject ONLY as "[trigger]".
-- DO NOT use words like person, woman, man, girl, boy, model, subject, individual.
-- If multiple people appear, still describe the primary subject as "[trigger]".
-- Never infer identity, age, or name.
+CRITICAL RULES:
+- Describe ONLY what is clearly visible. Do not guess missing details.
+- If a detail is uncertain, write "unclear" rather than inventing.
+- Refer to the main human subject ONLY as "[trigger]". Do not use person/woman/man/girl/boy/model/subject.
+- If the image contains nudity or sexual content, describe it clinically and neutrally (e.g., "nudity", "lingerie", "explicit sexual activity"), without erotic language.
 
-Describe the image with emphasis on:
-Pose: body position, limb placement, posture, orientation, gaze.
-Clothes: garments, colors, materials, layers, fit, footwear, accessories.
-Action: what [trigger] is doing, holding, touching, or interacting with.
-Scene: brief environment/context.
-
-Return exactly 4 lines in this format:
-Pose: ...
-Clothes: ...
-Action: ...
-Scene: ...
+Return exactly 5 lines:
+Pose: (posture, limb placement, orientation, gaze)
+Clothes: (garments, colors, layers; if nude, say "nudity" and what is visible)
+Action: (what [trigger] is doing/holding/touching/interacting with)
+NSFW: (none | nudity | lingerie | explicit)
+Scene: (brief environment/context)
 """
 
 def iter_images(folder: Path, recursive: bool):
@@ -52,6 +52,34 @@ def downscale(img: Image.Image, max_side: int) -> Image.Image:
     new_w = max(1, int(w * scale))
     new_h = max(1, int(h * scale))
     return img.resize((new_w, new_h), Image.LANCZOS)
+
+def hf_model_id_to_filename(model_id: str) -> str:
+    """
+    Convert a Hugging Face model id into a filesystem-safe,
+    but still HF-searchable, filename component.
+    """
+    # Replace "/" with "_" so org/model is preserved
+    s = model_id.replace("/", "_")
+
+    # Remove anything truly unsafe, keep dots and dashes
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", s)
+
+    return s
+
+def extract_text(result):
+    if isinstance(result, str):
+        return result
+    for attr in ("text", "output_text", "generated_text"):
+        v = getattr(result, attr, None)
+        if isinstance(v, str) and v.strip():
+            return v
+    try:
+        v = result["text"]
+        if isinstance(v, str):
+            return v
+    except Exception:
+        pass
+    return str(result)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -81,11 +109,25 @@ def main():
         return
 
     for img_path in imgs:
-        out_path = img_path.with_suffix(".txt")
+        model_tag = hf_model_id_to_filename(args.model)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+        out_path = img_path.with_name(
+            f"{img_path.stem}__{model_tag}__{ts}.txt"
+        )
+
         if out_path.exists() and not args.overwrite:
             print(f"SKIP (exists): {out_path.name}")
             continue
+        
+        header = (
+                f"# model: {args.model}\n"
+                f"# timestamp: {ts}\n"
+                f"# image: {img_path.name}\n\n"
+            )
 
+        out_path.write_text(header + caption + "\n", encoding="utf-8")
+        
         try:
             img = Image.open(img_path)
             if img.mode != "RGB":
@@ -95,20 +137,37 @@ def main():
 
             formatted = apply_chat_template(processor, config, args.prompt, num_images=1)
 
-            # generate() accepts PIL images in a list (per MLX-VLM docs/examples)
-            result = generate(
-                model,
-                processor,
-                formatted,
-                [img],
-                max_tokens=args.max_tokens,
-                temperature=args.temperature,
-                verbose=False,
-            )
+            # PASS 1: initial caption
+            result1 = generate(model, processor, formatted, [img],
+                   max_tokens=args.max_tokens, temperature=args.temperature, verbose=False)
+            
+            caption1 = extract_text(result1).strip()
+
+            # PASS 2: verification/correction
+            verify_prompt = f"""You are validating a caption against the image.
+
+            Caption to verify:
+            {caption1}
+
+            Instructions:
+            - Check each line for accuracy against the image.
+            - Remove any incorrect or uncertain details.
+            - Replace unknowns with "unclear".
+            - Keep the same 5-line format (Pose/Clothes/Action/NSFW/Scene).
+            - Main subject must be called [trigger].
+
+            Now output the corrected caption only.
+            """
+
+            formatted2 = apply_chat_template(processor, config, verify_prompt, num_images=1)
+            result2 = generate(model, processor, formatted2, [img],
+                            max_tokens=args.max_tokens, temperature=0.0, verbose=False)
+
+            caption = extract_text(result2).strip()
 
             # mlx-vlm may return either a string or a GenerationResult-like object
-            if isinstance(result, str):
-                caption = result
+            if isinstance(result1, str):
+                caption = result1
             else:
                 # common attribute names across versions
                 caption = (
@@ -126,16 +185,17 @@ def main():
             caption = caption.strip()
 
             # Hard replace common human nouns just in case
-            REPLACEMENTS = [
-                " person", " woman", " man", " girl", " boy",
-                " Person", " Woman", " Man", " Girl", " Boy",
-                " model", " Model", " subject", " Subject"
-            ]
+            #REPLACEMENTS = [
+            #    " person", " woman", " man", " girl", " boy",
+            #    " Person", " Woman", " Man", " Girl", " Boy",
+            #    " model", " Model", " subject", " Subject"
+            #]
 
-            for w in REPLACEMENTS:
-                caption = caption.replace(w, " [trigger]")
+            #for w in REPLACEMENTS:
+            #    caption = caption.replace(w, " [trigger]")
 
             out_path.write_text(caption + "\n", encoding="utf-8")
+
             print(f"OK: {img_path.name} -> {out_path.name}")
         except Exception as e:
             print(f"ERR: {img_path.name}: {e}")
