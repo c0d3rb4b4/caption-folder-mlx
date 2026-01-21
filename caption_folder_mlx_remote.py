@@ -1,130 +1,146 @@
 #!/usr/bin/env python3
 """
+caption_folder_mlx_remote.py
+
 Distributed image captioning across remote MLX machines via SSH.
 
-Orchestrates distribution of images to multiple MLX-capable machines,
-captures generated captions, and saves them back on the host.
-Maintains skip logic across all remote sessions.
-Processes images in parallel across all hosts with immediate caption write-back.
+- Copies one image at a time to each host's /tmp work dir
+- Runs caption_folder_mlx.py remotely inside a per-host venv
+- Copies the generated .txt back immediately (safe resume)
+
+Pinned deps are used to avoid common mlx-vlm/transformers incompatibilities.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import os
-import sys
+import shlex
 import threading
-from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
-from dataclasses import dataclass, asdict
 from queue import Queue
+from typing import Iterable, Optional
 
 import paramiko
 from tqdm import tqdm
 
-
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
-
 DEFAULT_MODEL = "mlx-community/Qwen2.5-VL-7B-Instruct-8bit"
-
-DEFAULT_PROMPT = """You are generating a factual caption for an image dataset.
-
-CRITICAL RULES:
-- Do NOT replace visible genital anatomy with euphemisms such as "inner thighs" or "private area".
-- Precision is preferred over vagueness when visibility is clear.
-- Describe ONLY what is clearly visible. Do not guess missing details.
-- If a detail is uncertain, write "unclear" rather than inventing.
-- Refer to the main human subject ONLY as "[trigger]". Do not use person/woman/man/girl/boy/model/subject.
-- If the image contains nudity or sexual content, describe it clinically and anatomically accurately.
-- Use correct anatomical terms (e.g., vulva, labia, penis, breasts) ONLY when they are clearly visible.
-- Do not euphemize anatomy that is clearly shown.
-- If anatomy is partially visible or ambiguous, say "unclear".
-
-Return exactly 5 lines:
-Pose: (posture, limb placement, orientation, gaze)
-Clothes: (garments, colors, layers; if nude, say "nudity" and what is visible)
-Action: (what [trigger] is doing with their body or hands; be anatomically accurate if visible)
-NSFW: (none | nudity | lingerie | explicit)
-Scene: (brief environment/context)
-"""
+REMOTE_DEP_VERSIONS = [
+    ("mlx", "0.30.3"),
+    ("mlx-vlm", "0.3.9"),
+    ("mlx-lm", "0.23.2"),
+    ("transformers", "4.51.3"),
+    ("Pillow", "12.1.0"),
+    ("tqdm", "4.67.1"),
+]
+REMOTE_DEP_VERSION_MAP = {name: version for name, version in REMOTE_DEP_VERSIONS}
+REMOTE_DEP_SPECS = [
+    f"{name}=={version}"
+    for name, version in REMOTE_DEP_VERSIONS
+    if name != "mlx-vlm"
+]
+REMOTE_VLM_SPEC = "mlx-vlm==0.3.9"
 
 
 @dataclass
 class RemoteHost:
-    """Configuration for a remote MLX machine."""
     hostname: str
     username: str
     password: str
     port: int = 22
-    remote_work_dir: str = "/tmp/caption_work"
-    script_path: str = "/opt/caption-folder-mlx/caption_folder_mlx.py"
+    remote_work_dir: str = "/tmp/caption_work_1"
+    script_path: str = ""
 
 
 def iter_images(folder: Path, recursive: bool) -> Iterable[Path]:
-    """Iterate over image files in folder."""
     if recursive:
         yield from (p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
     else:
         yield from (p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
 
 
+def model_to_safe_id(model_id: str) -> str:
+    s = model_id.replace("/", "_")
+    s = "".join(c if (c.isalnum() or c in "._-") else "_" for c in s)
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s.strip("_")
+
+
 def caption_file_exists(img_path: Path, model_id: str, fixed_name: bool) -> tuple[bool, Optional[Path]]:
-    """
-    Check if caption already exists for this image and model.
-    Returns (exists, path) where path is the existing file or None.
-    """
     if fixed_name:
         expected = img_path.with_suffix(".txt")
-        if expected.exists():
-            return True, expected
-        return False, None
-    
-    # For timestamped files, we need to check for any existing caption with this model
-    from re import escape
-    model_safe = model_id.replace("/", "_")
-    model_safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in model_safe).strip("_")
-    pattern = f"{img_path.stem}__{model_safe}__*.txt"
-    parent = img_path.parent
-    
-    matches = list(parent.glob(pattern))
-    if matches:
-        return True, matches[0]
-    return False, None
+        return (expected.exists(), expected if expected.exists() else None)
+    safe = model_to_safe_id(model_id)
+    matches = sorted(img_path.parent.glob(f"{img_path.stem}__{safe}__*.txt"))
+    return (len(matches) > 0, matches[0] if matches else None)
+
+
+def build_version_check_cmd(python_bin: str) -> str:
+    req_repr = repr(REMOTE_DEP_VERSION_MAP)
+    code = "\n".join(
+        [
+            "import importlib.metadata as md",
+            f"req = {req_repr}",
+            "bad = []",
+            "for name, expected in req.items():",
+            "    try:",
+            "        v = md.version(name)",
+            "    except md.PackageNotFoundError:",
+            "        bad.append(f\"{name} missing\")",
+            "        continue",
+            "    if v != expected:",
+            "        bad.append(f\"{name} {v} != {expected}\")",
+            "if bad:",
+            "    print(\"\\n\".join(bad))",
+            "    raise SystemExit(1)",
+            "print(\"deps_ok\")",
+        ]
+    )
+    return f"{python_bin} -c {shlex.quote(code)}"
+
+
+def build_version_summary_cmd(python_bin: str) -> str:
+    names = [name for name, _ in REMOTE_DEP_VERSIONS]
+    code = "\n".join(
+        [
+            "import importlib.metadata as md",
+            f"names = {repr(names)}",
+            "out = []",
+            "for name in names:",
+            "    try:",
+            "        out.append(f\"{name} {md.version(name)}\")",
+            "    except md.PackageNotFoundError:",
+            "        out.append(f\"{name} missing\")",
+            "print('; '.join(out))",
+        ]
+    )
+    return f"{python_bin} -c {shlex.quote(code)}"
 
 
 def ssh_connect(host: RemoteHost) -> paramiko.SSHClient:
-    """Create SSH connection to remote host."""
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        host.hostname,
-        port=host.port,
-        username=host.username,
-        password=host.password,
-        timeout=30,
-    )
-    return client
+    c = paramiko.SSHClient()
+    c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    c.connect(host.hostname, port=host.port, username=host.username, password=host.password, timeout=30)
+    return c
 
 
 def remote_exec(client: paramiko.SSHClient, command: str) -> tuple[int, str, str]:
-    """Execute command on remote host and return (returncode, stdout, stderr)."""
     _, stdout, stderr = client.exec_command(command)
-    out = stdout.read().decode("utf-8")
-    err = stderr.read().decode("utf-8")
-    returncode = stdout.channel.recv_exit_status()
-    return returncode, out, err
+    out = stdout.read().decode("utf-8", errors="replace")
+    err = stderr.read().decode("utf-8", errors="replace")
+    rc = stdout.channel.recv_exit_status()
+    return rc, out, err
 
 
 def remote_mkdir(client: paramiko.SSHClient, path: str) -> None:
-    """Create directory on remote host."""
-    rc, _, err = remote_exec(client, f"mkdir -p {path}")
+    rc, _, err = remote_exec(client, f"mkdir -p '{path}'")
     if rc != 0:
-        raise RuntimeError(f"Failed to create remote directory {path}: {err}")
+        raise RuntimeError(f"Failed to create remote dir {path}: {err.strip()}")
 
 
 def copy_to_remote(client: paramiko.SSHClient, local_path: Path, remote_path: str) -> None:
-    """Copy file from local to remote via SFTP."""
     sftp = client.open_sftp()
     try:
         sftp.put(str(local_path), remote_path)
@@ -133,7 +149,6 @@ def copy_to_remote(client: paramiko.SSHClient, local_path: Path, remote_path: st
 
 
 def copy_from_remote(client: paramiko.SSHClient, remote_path: str, local_path: Path) -> None:
-    """Copy file from remote to local via SFTP."""
     sftp = client.open_sftp()
     try:
         sftp.get(remote_path, str(local_path))
@@ -142,370 +157,224 @@ def copy_from_remote(client: paramiko.SSHClient, remote_path: str, local_path: P
 
 
 def load_hosts_config(config_file: Path) -> list[RemoteHost]:
-    """Load remote hosts from JSON config file."""
-    with open(config_file) as f:
-        data = json.load(f)
-    
-    hosts = []
-    for item in data.get("hosts", []):
-        hosts.append(RemoteHost(**item))
-    return hosts
-
-
-def save_hosts_config(config_file: Path, hosts: list[RemoteHost]) -> None:
-    """Save remote hosts to JSON config file."""
-    data = {
-        "hosts": [asdict(h) for h in hosts]
-    }
-    with open(config_file, "w") as f:
-        json.dump(data, f, indent=2)
+    data = json.loads(config_file.read_text(encoding="utf-8"))
+    return [RemoteHost(**h) for h in data.get("hosts", [])]
 
 
 def find_python_311(client: paramiko.SSHClient) -> str:
-    """
-    Try multiple ways to find Python 3.11.
-    Returns the command to use for Python 3.11 or raises error.
-    """
-    # Try different potential paths
     candidates = [
-        "python3.11",
-        "/usr/bin/python3.11",
+        "/opt/homebrew/bin/python3.11",
         "/usr/local/bin/python3.11",
-        "/opt/homebrew/bin/python3.11",  # macOS Apple Silicon
-        "python3",  # Fallback - check if it's 3.11
+        "/usr/bin/python3.11",
+        "python3.11",
+        "python3",
     ]
-    
-    for candidate in candidates:
-        rc, stdout, _ = remote_exec(client, f"{candidate} --version 2>&1")
-        if rc == 0 and "3.11" in stdout:
-            return candidate
-    
-    # Last resort: try with bash login shell
-    rc, stdout, _ = remote_exec(client, "bash -lc 'python3.11 --version 2>&1'")
-    if rc == 0 and "3.11" in stdout:
-        return "bash -lc 'python3.11"  # Special handling needed
-    
-    raise RuntimeError("Python 3.11 not found. Tried: " + ", ".join(candidates))
+    for c in candidates:
+        rc, out, _ = remote_exec(client, f"{c} --version 2>&1")
+        if rc == 0 and "3.11" in out:
+            return c
+    raise RuntimeError("Python 3.11 not found on remote host.")
 
 
-def setup_remote_host(
-    client: paramiko.SSHClient,
-    host: RemoteHost,
-    local_script_path: Path,
-) -> None:
-    """
-    Set up remote host with all requirements:
-    1. Check Python 3.11.14
-    2. Create virtual environment
-    3. Install dependencies
-    4. Copy caption script to remote
-    """
-    # Find Python 3.11
-    python_bin = find_python_311(client)
-    
-    # If it was the bash login shell version, extract just the base command
-    if "bash -lc" in python_bin:
-        python_base = "python3.11"
-        rc, stdout, stderr = remote_exec(client, f"bash -lc '{python_base} --version'")
-    else:
-        python_base = python_bin
-        rc, stdout, stderr = remote_exec(client, f"{python_bin} --version")
-    
-    python_version = stdout.strip()
-    tqdm.write(f"[{host.hostname}] Found {python_version} at: {python_base}")
-    
-    # Verify it's 3.11.x
-    if "3.11" not in python_version:
-        raise RuntimeError(f"Python 3.11 required on {host.hostname}, but found: {python_version}")
-    
-    # Create directories
+def setup_remote_host(client: paramiko.SSHClient, host: RemoteHost, local_caption_script: Path) -> None:
+    py = find_python_311(client)
+    rc, out, err = remote_exec(client, f"{py} --version 2>&1")
+    if rc != 0:
+        raise RuntimeError(err.strip())
+    tqdm.write(f"[{host.hostname}] Found {out.strip()} at: {py}")
+
     remote_mkdir(client, host.remote_work_dir)
     venv_dir = f"{host.remote_work_dir}/.venv"
-    
-    # Check if venv already exists and has all requirements
-    check_venv = f"test -f {venv_dir}/bin/python && {venv_dir}/bin/python -c 'import mlx_vlm, PIL, tqdm' 2>/dev/null"
-    rc, _, _ = remote_exec(client, check_venv)
-    
-    if rc == 0:
-        tqdm.write(f"[{host.hostname}] Virtual environment already set up with all requirements")
-    else:
-        tqdm.write(f"[{host.hostname}] Setting up virtual environment with Python 3.11...")
-        
-        # Create virtual environment using found Python 3.11
-        rc, _, err = remote_exec(client, f"{python_base} -m venv {venv_dir}")
-        if rc != 0:
-            raise RuntimeError(f"Failed to create venv on {host.hostname}: {err}")
-        
-        tqdm.write(f"[{host.hostname}] Installing dependencies...")
-        
-        # Upgrade pip and install dependencies
-        pip_cmd = f"{venv_dir}/bin/pip install --upgrade pip setuptools wheel"
-        rc, _, err = remote_exec(client, pip_cmd)
-        if rc != 0:
-            raise RuntimeError(f"Failed to upgrade pip on {host.hostname}: {err}")
-        
-        # Install required packages with specific versions
-        # Use latest mlx-vlm with compatible transformers for Pixtral/Paligemma
-        deps = [
-            "mlx>=0.0.14",
-            "mlx-vlm>=0.1.0",  # Latest version
-            "transformers>=4.45.0",  # Required for newer models
-            "Pillow>=10.0.0",
-            "tqdm>=4.66.0",
-        ]
-        
-        for dep in deps:
-            install_cmd = f"{venv_dir}/bin/pip install '{dep}'"
-            rc, _, err = remote_exec(client, install_cmd)
-            if rc != 0:
-                raise RuntimeError(f"Failed to install {dep} on {host.hostname}: {err}")
-            tqdm.write(f"[{host.hostname}] Installed {dep}")
-    
-    # Copy caption script to remote if needed
-    # Deploy script to the work directory (more reliable than parent directory)
-    expected_script_path = f"{host.remote_work_dir}/caption_folder_mlx.py"
-    
-    # Check if script exists
-    rc, _, _ = remote_exec(client, f"test -f {expected_script_path}")
+    pyvenv = f"{venv_dir}/bin/python"
+    pip = f"{venv_dir}/bin/pip"
+
+    rc, _, _ = remote_exec(client, f"test -f '{pyvenv}'")
     if rc != 0:
-        if not local_script_path.exists():
-            raise RuntimeError(f"Local script not found: {local_script_path}")
-        
-        tqdm.write(f"[{host.hostname}] Copying caption script...")
-        # Ensure work directory exists
-        remote_mkdir(client, host.remote_work_dir)
-        try:
-            copy_to_remote(client, local_script_path, expected_script_path)
-        except Exception as e:
-            raise RuntimeError(f"Failed to copy script to {host.hostname}: {e}")
-        
-        tqdm.write(f"[{host.hostname}] Script deployed to {expected_script_path}")
-    else:
-        tqdm.write(f"[{host.hostname}] Script already deployed")
-    
-    # Always use the deployed script path in work directory
-    host.script_path = expected_script_path
-    
-    # Verify setup
-    verify_cmd = f"{venv_dir}/bin/python -c 'import mlx_vlm, PIL; print(\"Setup verified\")'"
-    rc, stdout, err = remote_exec(client, verify_cmd)
+        tqdm.write(f"[{host.hostname}] Creating venv...")
+        rc, _, err = remote_exec(client, f"{py} -m venv '{venv_dir}'")
+        if rc != 0:
+            raise RuntimeError(err.strip())
+
+    rc, out, err = remote_exec(client, build_version_check_cmd(pyvenv))
     if rc != 0:
-        raise RuntimeError(f"Setup verification failed on {host.hostname}: {err}")
-    
-    tqdm.write(f"[{host.hostname}] Setup complete and verified")
+        details = (out or err).strip()
+        if details:
+            tqdm.write(f"[{host.hostname}] Deps mismatch:\n{details}")
+        tqdm.write(f"[{host.hostname}] Installing deps (pinned)...")
+        rc, _, err = remote_exec(client, f"{pip} install -U pip setuptools wheel")
+        if rc != 0:
+            raise RuntimeError(err.strip())
+        joined = " ".join(shlex.quote(r) for r in REMOTE_DEP_SPECS)
+        rc, _, err = remote_exec(client, f"{pip} install -U {joined}")
+        if rc != 0:
+            raise RuntimeError(err.strip())
+        # Install mlx-vlm without deps to keep transformers pinned to a known-good version.
+        rc, _, err = remote_exec(client, f"{pip} install -U --no-deps {shlex.quote(REMOTE_VLM_SPEC)}")
+        if rc != 0:
+            raise RuntimeError(err.strip())
+        rc, out, err = remote_exec(client, build_version_check_cmd(pyvenv))
+        if rc != 0:
+            raise RuntimeError((out or err).strip())
+    else:
+        tqdm.write(f"[{host.hostname}] Deps already match pinned versions")
+
+    remote_script = f"{host.remote_work_dir}/caption_folder_mlx.py"
+    copy_to_remote(client, local_caption_script, remote_script)
+    host.script_path = remote_script
+
+    rc, out, err = remote_exec(client, build_version_summary_cmd(pyvenv))
+    if rc != 0:
+        raise RuntimeError(err.strip())
+    tqdm.write(f"[{host.hostname}] Setup OK: {out.strip()}")
 
 
-def process_worker(
-    host: RemoteHost,
-    image_queue: Queue,
-    pbar: tqdm,
-    args,
-    fixed_name: bool,
-) -> None:
-    """Worker thread that processes images from queue on a single remote host."""
+def process_worker(host: RemoteHost, q: Queue, pbar: tqdm, args) -> None:
+    client = None
     try:
         client = ssh_connect(host)
         venv_dir = f"{host.remote_work_dir}/.venv"
-        python_bin = f"{venv_dir}/bin/python"
-        remote_mkdir(client, host.remote_work_dir)
-        
+        py = f"{venv_dir}/bin/python"
+
         while True:
-            # Get next image from shared queue (None signals end)
-            img_path = image_queue.get()
+            img_path = q.get()
             if img_path is None:
                 break
-            
+
+            remote_img = f"{host.remote_work_dir}/{img_path.name}"
             try:
-                pbar.set_postfix_str(f"Processing on {host.hostname}: {img_path.name}")
-                
-                # Copy image to remote
-                remote_img_path = f"{host.remote_work_dir}/{img_path.name}"
-                copy_to_remote(client, img_path, remote_img_path)
-                
-                # Build remote caption command using venv python
-                remote_cmd = f"{python_bin} {host.script_path} {host.remote_work_dir}"
-                remote_cmd += f" --model '{args.model}'"
-                remote_cmd += f" --max-tokens {args.max_tokens}"
-                remote_cmd += f" --temperature {args.temperature}"
-                remote_cmd += f" --max-side {args.max_side}"
-                
+                copy_to_remote(client, img_path, remote_img)
+
+                cmd = (
+                    f"{py} {shlex.quote(host.script_path)} {shlex.quote(host.remote_work_dir)}"
+                    f" --model {shlex.quote(args.model)}"
+                    f" --max-side {args.max_side}"
+                    f" --max-tokens {args.max_tokens}"
+                    f" --temperature {args.temperature}"
+                )
+                if args.prompt:
+                    cmd += f" --prompt {shlex.quote(args.prompt)}"
+                if args.overwrite:
+                    cmd += " --overwrite"
                 if args.fixed_name:
-                    remote_cmd += " --fixed-name"
+                    cmd += " --fixed-name"
                 if args.verify:
-                    remote_cmd += " --verify"
+                    cmd += " --verify"
                 if args.no_replace_nouns:
-                    remote_cmd += " --no-replace-nouns"
-                
-                # Run captioning on remote
-                rc, stdout, stderr = remote_exec(client, remote_cmd)
-                
+                    cmd += " --no-replace-nouns"
+
+                rc, out, err = remote_exec(client, cmd)
                 if rc != 0:
-                    tqdm.write(f"ERR: {host.hostname} - {img_path.name}: {stderr.strip()}")
+                    tqdm.write(f"ERR: {host.hostname} - {img_path.name}: {err.strip() or out.strip()}")
+                    remote_exec(client, f"rm -f '{remote_img}'")
                     pbar.update(1)
                     continue
-                
-                # Find the generated caption file on remote
-                list_cmd = f"ls -t {host.remote_work_dir}/{img_path.stem}*.txt 2>/dev/null | head -1"
-                rc, remote_cap_path, _ = remote_exec(client, list_cmd)
-                
-                if rc != 0 or not remote_cap_path.strip():
-                    tqdm.write(f"ERR: {host.hostname} - {img_path.name}: No caption file generated")
-                    pbar.update(1)
-                    continue
-                
-                remote_cap_path = remote_cap_path.strip()
-                
-                # Determine local output path
+
                 if args.fixed_name:
-                    local_cap_path = img_path.with_suffix(".txt")
+                    remote_cap = f"{host.remote_work_dir}/{img_path.stem}.txt"
                 else:
-                    # Extract just the filename from remote path
-                    remote_filename = remote_cap_path.split("/")[-1]
-                    local_cap_path = img_path.parent / remote_filename
-                
-                # Copy caption back to host (IMMEDIATE write-back)
-                copy_from_remote(client, remote_cap_path, local_cap_path)
-                
-                # Cleanup remote files
-                remote_exec(client, f"rm -f {remote_img_path} {remote_cap_path}")
-                
-                pbar.set_postfix_str(f"✓ Generated: {local_cap_path.name}")
+                    safe = model_to_safe_id(args.model)
+                    rc2, out2, _ = remote_exec(
+                        client,
+                        f"ls -t '{host.remote_work_dir}/{img_path.stem}__{safe}__'*.txt 2>/dev/null | head -1",
+                    )
+                    remote_cap = out2.strip() if rc2 == 0 else ""
+
+                if not remote_cap:
+                    tqdm.write(f"ERR: {host.hostname} - {img_path.name}: no caption output found")
+                    remote_exec(client, f"rm -f '{remote_img}'")
+                    pbar.update(1)
+                    continue
+
+                local_cap = img_path.with_suffix(".txt") if args.fixed_name else (img_path.parent / Path(remote_cap).name)
+                copy_from_remote(client, remote_cap, local_cap)
+
+                remote_exec(client, f"rm -f '{remote_img}' '{remote_cap}'")
+
+                pbar.set_postfix_str(f"{host.hostname}: ✓ {local_cap.name}")
                 pbar.update(1)
-                
+
             except Exception as e:
                 tqdm.write(f"ERR: {host.hostname} - {img_path.name}: {e}")
                 pbar.update(1)
-        
-        client.close()
-        
-    except Exception as e:
-        tqdm.write(f"ERR: Failed to connect to {host.hostname}: {e}")
+
+    finally:
+        if client:
+            client.close()
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(
-        description="Distribute image captioning across remote MLX machines via SSH."
-    )
-    ap.add_argument("folder", nargs="?", help="Local folder containing images")
-    ap.add_argument("--config", required=True, help="JSON config file with remote host credentials")
-    ap.add_argument("--model", default=DEFAULT_MODEL, help="MLX model id/path")
-    ap.add_argument("--prompt", default=DEFAULT_PROMPT, help="Caption prompt")
-    ap.add_argument("--recursive", action="store_true", help="Recurse into subfolders")
-    ap.add_argument("--fixed-name", action="store_true", help="Write <image_stem>.txt")
-    ap.add_argument("--overwrite", action="store_true", help="Overwrite existing output files")
+    ap = argparse.ArgumentParser(description="Distributed MLX image captioning over SSH.")
+    ap.add_argument("folder", help="Local folder containing images")
+    ap.add_argument("--config", required=True, help="JSON config file with hosts")
+    ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--prompt", help="Optional prompt override passed to caption_folder_mlx.py")
+    ap.add_argument("--recursive", action="store_true")
+    ap.add_argument("--fixed-name", action="store_true")
+    ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--max-tokens", type=int, default=170)
     ap.add_argument("--temperature", type=float, default=0.15)
-    ap.add_argument("--max-side", type=int, default=1280, help="Resize so longest side <= this")
-    ap.add_argument("--verify", action="store_true", help="Second pass verification")
-    ap.add_argument("--no-replace-nouns", action="store_true", help="Skip noun replacement")
+    ap.add_argument("--max-side", type=int, default=1280)
+    ap.add_argument("--verify", action="store_true")
+    ap.add_argument("--no-replace-nouns", action="store_true")
 
     args = ap.parse_args()
-
-    # Check and install local dependencies
-    print("Checking local dependencies...")
-    try:
-        import paramiko
-        from tqdm import tqdm as _  # Just check if tqdm is available
-    except ImportError:
-        print("Installing required local packages (paramiko, tqdm)...")
-        import subprocess
-        import sys
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "paramiko", "tqdm", "-q"])
-        print("Local dependencies installed!")
-    
-    if not args.folder:
-        ap.print_help()
-        raise SystemExit(2)
 
     folder = Path(args.folder).expanduser().resolve()
     if not folder.exists():
         raise SystemExit(f"Folder not found: {folder}")
 
-    config_file = Path(args.config).expanduser().resolve()
-    if not config_file.exists():
-        raise SystemExit(f"Config file not found: {config_file}")
+    config = Path(args.config).expanduser().resolve()
+    if not config.exists():
+        raise SystemExit(f"Config not found: {config}")
 
-    # Load remote hosts
-    try:
-        hosts = load_hosts_config(config_file)
-    except Exception as e:
-        raise SystemExit(f"Failed to load config: {e}")
-
+    hosts = load_hosts_config(config)
     if not hosts:
-        raise SystemExit("No hosts configured in config file")
+        raise SystemExit("No hosts in config")
 
-    # Verify local script exists
-    script_dir = Path(__file__).parent
-    local_script = script_dir / "caption_folder_mlx.py"
-    if not local_script.exists():
-        raise SystemExit(f"Local script not found: {local_script}")
+    local_caption_script = Path(__file__).parent / "caption_folder_mlx.py"
+    if not local_caption_script.exists():
+        raise SystemExit(f"caption_folder_mlx.py not found next to remote script: {local_caption_script}")
 
-    # Collect images
-    images = sorted(iter_images(folder, args.recursive))
-    if not images:
+    imgs = sorted(iter_images(folder, args.recursive))
+    if not imgs:
         print("No images found.")
         return
 
-    # Filter out images that already have captions (unless --overwrite)
-    images_to_process = []
-    for img_path in images:
+    to_process = []
+    for p in imgs:
         if not args.overwrite:
-            exists, _ = caption_file_exists(img_path, args.model, args.fixed_name)
+            exists, _ = caption_file_exists(p, args.model, args.fixed_name)
             if exists:
                 continue
-        images_to_process.append(img_path)
+        to_process.append(p)
 
-    total_images = len(images_to_process)
-    print(f"Found {total_images} image(s) to process ({len(images) - total_images} already captioned).")
-
-    if total_images == 0:
-        print("All images already have captions.")
+    print(f"Found {len(imgs)} image(s) to scan ({len(imgs)-len(to_process)} already captioned).")
+    if not to_process:
+        print("Nothing to do.")
         return
 
-    # Setup all remote hosts
     print("\nSetting up remote hosts...")
-    for host in hosts:
-        try:
-            client = ssh_connect(host)
-            setup_remote_host(client, host, local_script)
-            client.close()
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            raise SystemExit(f"Failed to setup {host.hostname}: {e}")
+    for h in hosts:
+        c = ssh_connect(h)
+        setup_remote_host(c, h, local_caption_script)
+        c.close()
+        tqdm.write(f"[{h.hostname}] Ready")
 
-    print("All remote hosts ready!\n")
-
-    # Create shared queue for images to process
-    image_queue: Queue = Queue()
-    for img_path in images_to_process:
-        image_queue.put(img_path)
-    
-    # Add sentinel values (None) for each worker to signal end of work
+    q: Queue = Queue()
+    for p in to_process:
+        q.put(p)
     for _ in hosts:
-        image_queue.put(None)
-    
-    # Progress tracking
-    pbar = tqdm(total=total_images, desc="Remote captioning", unit="img")
+        q.put(None)
 
-    try:
-        # Start worker thread for each host
-        threads = []
-        for host in hosts:
-            thread = threading.Thread(
-                target=process_worker,
-                args=(host, image_queue, pbar, args, args.fixed_name),
-                daemon=False,
-            )
-            thread.start()
-            threads.append(thread)
-        
-        # Wait for all workers to complete
-        for thread in threads:
-            thread.join()
-        
-    finally:
-        pbar.close()
+    pbar = tqdm(total=len(to_process), desc="Remote captioning", unit="img")
+    threads = []
+    for h in hosts:
+        t = threading.Thread(target=process_worker, args=(h, q, pbar, args), daemon=False)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+    pbar.close()
 
     print("\nDistributed captioning complete!")
 
